@@ -242,6 +242,7 @@ SELECT
     -- Identificador do ARMARIO. Pode repetir. Usado para localizar o
     -- item fisicamente e para busca no balcao.
     p.ticket,
+    p.ticket_num,
 
     p.hospede_nome,
     p.hospede_tipo,
