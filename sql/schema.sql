@@ -68,6 +68,21 @@ INSERT INTO categoria_item (nome) VALUES
 CREATE TABLE protocolo (
     id                     INTEGER PRIMARY KEY,
 
+    -- IDENTIFICACAO
+    -- ticket: numero do ticket fisico de 2 vias, uma no item e outra no
+    -- registro. E o identificador que o colaborador usa no balcao, mas
+    -- NAO e chave: o rolo tem 4 ou 5 digitos e reinicia, entao o mesmo
+    -- numero volta a circular antes do item vencer (politica de 180
+    -- dias). Sem UNIQUE de proposito: constraint travaria o registro
+    -- com o hospede esperando. Colisao entre ATIVOS e detectada e
+    -- avisada pela aplicacao, nunca bloqueada. Ver vw_ticket_colidido.
+    -- TEXT para preservar zero a esquerda e aceitar 4 ou 5 digitos.
+    ticket                 TEXT    NOT NULL,
+
+    -- forma numerica do ticket, so para busca: permite achar '0042'
+    -- digitando '42'. VIRTUAL, nao ocupa espaco, e indexada.
+    ticket_num             INTEGER GENERATED ALWAYS AS (CAST(ticket AS INTEGER)) VIRTUAL,
+
     -- destinatario
     hospede_nome           TEXT    NOT NULL,
     hospede_tipo           TEXT    NOT NULL DEFAULT 'hospede'
@@ -137,6 +152,10 @@ CREATE TABLE protocolo (
     -- Documento nunca completo.
     CHECK (retirado_por_doc_final IS NULL OR length(retirado_por_doc_final) <= 3),
 
+    -- Ticket entre 3 e 6 digitos, so numeros. Maleavel de proposito:
+    -- o hotel recebe rolo de 4 e de 5 digitos.
+    CHECK (length(ticket) BETWEEN 3 AND 6),
+
     -- Saida nao pode ser anterior a entrada.
     CHECK (entregue_em   IS NULL OR entregue_em   >= recebido_em),
     CHECK (descartado_em IS NULL OR descartado_em >= recebido_em)
@@ -190,6 +209,7 @@ CREATE TABLE verificacao (
 -- Cobrem as consultas quentes: lista de ativos, busca por hospede,
 -- ordenacao por data.
 -- =====================================================================
+CREATE INDEX idx_protocolo_ticket   ON protocolo(ticket_num);
 CREATE INDEX idx_protocolo_ativo    ON protocolo(recebido_em)
     WHERE entregue_em IS NULL AND descartado_em IS NULL;
 CREATE INDEX idx_protocolo_recebido ON protocolo(recebido_em DESC);
@@ -213,6 +233,16 @@ CREATE INDEX idx_anexo_protocolo    ON anexo(protocolo_id, tipo);
 CREATE VIEW vw_protocolo AS
 SELECT
     p.id,
+
+    -- Identificador do SISTEMA. Derivado do id, nunca repete.
+    -- E este que aparece impresso e em relatorio, nao o ticket.
+    'SB-' || strftime('%Y', p.recebido_em) || '-' || printf('%04d', p.id)
+                                           AS codigo,
+
+    -- Identificador do ARMARIO. Pode repetir. Usado para localizar o
+    -- item fisicamente e para busca no balcao.
+    p.ticket,
+
     p.hospede_nome,
     p.hospede_tipo,
     p.companhia,
@@ -301,3 +331,29 @@ SELECT
                    THEN horas_permanencia END), 1)     AS media_horas_ate_retirada
 FROM vw_protocolo
 GROUP BY turno_entrada, hospede_tipo;
+
+
+-- ---------------------------------------------------------------------
+-- vw_ticket_colidido
+-- Tickets repetidos ENTRE PROTOCOLOS ATIVOS. So ativos importam: ticket
+-- repetido entre um item entregue ano passado e um que chegou hoje nao
+-- e problema, porque o antigo nao esta mais no armario.
+--
+-- E a tela que a operacao abre quando dois itens aparecem com o mesmo
+-- numero. Mostra os concorrentes lado a lado para desempate por foto,
+-- descricao e quarto.
+-- ---------------------------------------------------------------------
+CREATE VIEW vw_ticket_colidido AS
+SELECT
+    a.ticket,
+    COUNT(*)                            AS qtd_ativos,
+    GROUP_CONCAT(a.codigo, ' | ')       AS codigos,
+    GROUP_CONCAT(a.quarto, ' | ')       AS quartos,
+    GROUP_CONCAT(a.categoria, ' | ')    AS categorias,
+    MIN(a.recebido_em)                  AS mais_antigo,
+    MAX(a.recebido_em)                  AS mais_recente
+FROM vw_protocolo a
+WHERE a.status = 'ativo'
+GROUP BY a.ticket
+HAVING COUNT(*) > 1
+ORDER BY mais_antigo ASC;

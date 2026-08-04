@@ -10,6 +10,7 @@ Uso:
     python src/seed.py
 """
 
+import math
 import random
 import sqlite3
 import unicodedata
@@ -20,15 +21,60 @@ from faker import Faker
 from PIL import Image, ImageDraw, ImageFont
 
 # =====================================================================
-# CONFIGURACAO
+# PARAMETROS DO MODELO
+#
+# Cada numero abaixo esta rotulado pela origem. A distincao importa:
+# estimativa apresentada como medicao seria desonestidade, e o valor
+# deste gerador nao esta em os dados serem verdadeiros (sao sinteticos
+# por design) e sim em o MODELO GERADOR ser defensavel.
+#
+#   [OBSERVADO]  regra ou fato verificavel da operacao
+#   [ESTIMADO]   estimativa de quem trabalha na portaria, SEM contagem
+#                sistematica. Fonte: ~3 anos de operacao, tendo rodado
+#                todos os turnos. Nao e medicao.
+#   [DERIVADO]   calculado a partir dos dois acima, com a conta a vista
 # =====================================================================
+
 SEMENTE = 42            # base reproduzivel: mesmo comando, mesmo resultado
-N_PROTOCOLOS = 400
-DIAS_HISTORICO = 240    # > 180 para a politica de descarte ter efeito
-PCT_TRIPULANTE = 0.22
-PCT_NUNCA_RETIRADO = 0.08
-PCT_TERCEIRO = 0.18     # entre os entregues, quantos por terceiro
-DIAS_POLITICA_DESCARTE = 180
+
+# --- volume ---
+PROTOCOLOS_POR_DIA = 3        # [ESTIMADO] 5 a 6 em dia cheio, ~3 na media
+DIAS_HISTORICO = 240          # [DERIVADO] > 180 para a politica de descarte
+                              #            aparecer na base
+N_PROTOCOLOS = PROTOCOLOS_POR_DIA * DIAS_HISTORICO   # [DERIVADO] 720
+
+RAZAO_BAGAGEM = 9             # [ESTIMADO] ~9 bagagens para cada protocolo
+PCT_PROTOCOLO = 1 / (1 + RAZAO_BAGAGEM)              # [DERIVADO] 0.10
+ITENS_POR_DIA = PROTOCOLOS_POR_DIA / PCT_PROTOCOLO   # [DERIVADO] 30/dia
+                              # bagagem + protocolo, dividem o mesmo rolo
+
+# --- retirada ---
+MEDIANA_HORAS_HOSPEDE = 24.0  # [ESTIMADO] encomenda sai em ~1 dia
+MEDIANA_HORAS_TRIPULANTE = 3.5  # [ESTIMADO] tripulacao retira no mesmo pernoite
+PCT_TRIPULANTE = 0.22         # [ESTIMADO] fatia de itens de tripulacao
+PCT_TERCEIRO = 0.18           # [ESTIMADO] retiradas feitas por terceiro
+
+# --- itens que encalham ---
+# [DERIVADO] O armario tem ~30 itens dentro da janela de 180 dias, dos
+# quais ~4 sao do dia. Sobram ~26 encalhados. Com 3 entradas por dia e
+# janela de 180 dias: 26 / (3 * 180) = 4.8% das entradas encalham.
+ARMARIO_OBSERVADO = 30        # [ESTIMADO] itens na prateleira, contagem de olho
+ARMARIO_DO_DIA = 4            # [DERIVADO] 3/dia com mediana de 24h
+DIAS_POLITICA_DESCARTE = 180  # [OBSERVADO] politica do hotel, 6 meses
+PCT_NUNCA_RETIRADO = (ARMARIO_OBSERVADO - ARMARIO_DO_DIA) / (
+    PROTOCOLOS_POR_DIA * DIAS_POLITICA_DESCARTE)     # [DERIVADO] 0.048
+
+# [OBSERVADO] A limpeza do armario nao acontece no prazo: a ultima foi
+# ha mais de um ano. Por isso a maioria dos itens vencidos continua
+# ATIVA na base, em vez de descartada. Isso e o retrato da operacao, nao
+# um defeito do gerador.
+PCT_VENCIDO_DESCARTADO = 0.60
+
+# --- rolo de tickets ---
+# [DERIVADO] 9999 numeros / 30 itens por dia = 333 dias por volta.
+# A folga sobre a politica de 180 dias e o que torna a colisao de ticket
+# impossivel QUANDO a limpeza acontece no prazo. Ver README.
+CICLO_ROLO_DIAS = 9999 / ITENS_POR_DIA               # [DERIVADO] 333
 
 RAIZ = Path(__file__).resolve().parent.parent
 DB = RAIZ / "data" / "smartbook.db"
@@ -136,11 +182,16 @@ def sortear_hora(curva):
 
 
 def horas_ate_retirada(tipo):
-    """Cauda longa: maioria rapida, alguns dias. Lognormal truncada."""
+    """Lognormal: maioria rapida, cauda longa de alguns dias.
+
+    O parametro mu de uma lognormal e o log da MEDIANA, entao ln() das
+    constantes estimadas entrega exatamente a mediana informada pela
+    operacao. sigma controla o tamanho da cauda.
+    """
     if tipo == "tripulante":
-        h = random.lognormvariate(1.2, 0.8)     # mediana ~3h
+        h = random.lognormvariate(math.log(MEDIANA_HORAS_TRIPULANTE), 0.8)
         return min(max(h, 0.3), 72)
-    h = random.lognormvariate(2.2, 1.1)          # mediana ~9h
+    h = random.lognormvariate(math.log(MEDIANA_HORAS_HOSPEDE), 1.1)
     return min(max(h, 0.5), 24 * 20)
 
 
@@ -179,6 +230,52 @@ def gerar_foto_item(protocolo_id, categoria, descricao):
     caminho = DIR_FOTOS / f"item_{protocolo_id:04d}.jpg"
     img.save(caminho, "JPEG", quality=65)
     return f"data/fotos/{caminho.name}"
+
+
+def gerar_tickets(n):
+    """Simula o rolo fisico de tickets, em ordem cronologica.
+
+    O rolo anda de 1 em 1, mas a MAIOR PARTE dos numeros e consumida por
+    bagagem, que nao entra neste banco. Por isso dois protocolos
+    seguidos nao tem tickets seguidos: tem buracos.
+
+    O buraco leva em conta DUAS coisas:
+      1. a bagagem, que consome ~85% dos numeros
+      2. o fato de esta base ser uma AMOSTRA (400 dos ~5400 protocolos
+         que passariam pela portaria em 240 dias)
+
+    Ignorar o item 2 encolhe o consumo do rolo em 13x e faz a colisao
+    sumir do dataset, o que seria falso: no volume real o rolo de 9999
+    da a volta a cada ~67 dias, bem antes dos 180 dias da politica.
+
+    Quando o rolo acaba, volta ao inicio. E a volta do rolo que produz
+    colisao, nao coincidencia.
+    """
+    protocolos_reais = ITENS_POR_DIA * PCT_PROTOCOLO * DIAS_HISTORICO
+    fator_amostra = protocolos_reais / n
+    buraco_medio = (1 / PCT_PROTOCOLO) * fator_amostra
+
+    tickets = []
+    fim_rolo = 9999
+    atual = random.randint(1, 400)
+
+    for _ in range(n):
+        atual += int(random.uniform(0.4, 1.6) * buraco_medio)
+
+        if atual > fim_rolo:             # rolo acabou, comeca outro
+            atual = random.randint(1, 20)
+            sorte = random.random()
+            if sorte < 0.18:
+                fim_rolo = random.randint(400, 900)   # lote curto
+            elif sorte < 0.28:
+                fim_rolo = 99999                      # rolo de 5 digitos
+            else:
+                fim_rolo = 9999
+
+        largura = 5 if fim_rolo > 9999 else 4
+        tickets.append(f"{atual:0{largura}d}")
+
+    return tickets
 
 
 def gerar_comprovante(protocolo_id, tipo):
@@ -244,9 +341,12 @@ def popular(conn):
     agora = datetime.now().replace(microsecond=0)
     inicio = agora - timedelta(days=DIAS_HISTORICO)
 
-    protocolos, anexos = [], []
+    # Fase 1: gera os registros SEM id e SEM ticket.
+    # O id e o ticket so podem ser atribuidos depois de ordenar por data,
+    # porque os dois seguem a ordem de chegada no balcao.
+    registros = []
 
-    for i in range(1, N_PROTOCOLOS + 1):
+    for _ in range(N_PROTOCOLOS):
         eh_tripulante = random.random() < PCT_TRIPULANTE
         tipo = "tripulante" if eh_tripulante else "hospede"
         companhia = random.choice(COMPANHIAS) if eh_tripulante else None
@@ -281,7 +381,7 @@ def popular(conn):
                     r_doc_final = f"{random.randint(0, 999):03d}"
         else:
             idade = (agora - recebido).days
-            if idade >= DIAS_POLITICA_DESCARTE and random.random() < 0.35:
+            if idade >= DIAS_POLITICA_DESCARTE and random.random() < PCT_VENCIDO_DESCARTADO:
                 descartado = recebido + timedelta(days=DIAS_POLITICA_DESCARTE,
                                                   hours=random.uniform(1, 60))
                 if descartado < agora:
@@ -289,29 +389,49 @@ def popular(conn):
                 else:
                     descartado = None
 
-        protocolos.append((
-            i, fake.name(), tipo, companhia, random.choice(quartos),
-            cat_id[categoria], descricao,
-            recebido.strftime("%Y-%m-%d %H:%M:%S"), recebido_por,
-            entregue.strftime("%Y-%m-%d %H:%M:%S") if entregue else None, entregue_por,
-            descartado.strftime("%Y-%m-%d %H:%M:%S") if descartado else None, descartado_por,
-            r_tipo, r_nome, r_doc_tipo, r_doc_final,
+        registros.append(dict(
+            hospede_nome=fake.name(), hospede_tipo=tipo, companhia=companhia,
+            quarto=random.choice(quartos), categoria=categoria,
+            categoria_id=cat_id[categoria], descricao=descricao,
+            recebido=recebido, recebido_por=recebido_por,
+            entregue=entregue, entregue_por=entregue_por,
+            descartado=descartado, descartado_por=descartado_por,
+            r_tipo=r_tipo, r_nome=r_nome,
+            r_doc_tipo=r_doc_tipo, r_doc_final=r_doc_final,
         ))
 
-        anexos.append((i, "item", gerar_foto_item(i, categoria, descricao)))
-        if entregue:
+    # Fase 2: ordena por chegada e atribui id e ticket em sequencia.
+    registros.sort(key=lambda r: r["recebido"])
+    tickets = gerar_tickets(len(registros))
+
+    protocolos, anexos = [], []
+    fmt = lambda d: d.strftime("%Y-%m-%d %H:%M:%S") if d else None
+
+    for i, (r, ticket) in enumerate(zip(registros, tickets), start=1):
+        protocolos.append((
+            i, ticket, r["hospede_nome"], r["hospede_tipo"], r["companhia"],
+            r["quarto"], r["categoria_id"], r["descricao"],
+            fmt(r["recebido"]), r["recebido_por"],
+            fmt(r["entregue"]), r["entregue_por"],
+            fmt(r["descartado"]), r["descartado_por"],
+            r["r_tipo"], r["r_nome"], r["r_doc_tipo"], r["r_doc_final"],
+        ))
+
+        anexos.append((i, "item", gerar_foto_item(i, r["categoria"], r["descricao"])))
+        if r["entregue"]:
             anexos.append((i, "assinatura", gerar_assinatura(i)))
-            if r_tipo == "terceiro":
+            if r["r_tipo"] == "terceiro":
                 anexos.append((i, "documento", gerar_comprovante(i, "documento")))
                 anexos.append((i, "autorizacao", gerar_comprovante(i, "autorizacao")))
 
     cur.executemany("""
         INSERT INTO protocolo
-            (id, hospede_nome, hospede_tipo, companhia, quarto, categoria_id,
-             descricao, recebido_em, recebido_por_id, entregue_em, entregue_por_id,
-             descartado_em, descartado_por_id, retirado_por_tipo, retirado_por_nome,
+            (id, ticket, hospede_nome, hospede_tipo, companhia, quarto,
+             categoria_id, descricao, recebido_em, recebido_por_id,
+             entregue_em, entregue_por_id, descartado_em, descartado_por_id,
+             retirado_por_tipo, retirado_por_nome,
              retirado_por_doc_tipo, retirado_por_doc_final)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, protocolos)
 
     cur.executemany(
@@ -337,6 +457,18 @@ def resumo(conn):
 
     n = conn.execute("SELECT COUNT(*) FROM vw_protocolo_vencido").fetchone()[0]
     print(f"\n--- aba de descarte: {n} protocolos vencidos ou em alerta ---")
+
+    print("\n--- colisao de ticket entre protocolos ativos ---")
+    linhas = list(conn.execute(
+        "SELECT ticket, qtd_ativos, quartos, categorias FROM vw_ticket_colidido"))
+    if not linhas:
+        print("  nenhuma no momento")
+    for t, q, quartos, cats in linhas:
+        print(f"  ticket {t}: {q} ativos | quartos {quartos} | {cats}")
+
+    largura = conn.execute(
+        "SELECT length(ticket), COUNT(*) FROM protocolo GROUP BY 1").fetchall()
+    print(f"\n--- digitos do ticket: {dict(largura)} ---")
 
 
 if __name__ == "__main__":
